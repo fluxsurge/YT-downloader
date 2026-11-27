@@ -4,6 +4,7 @@
     python tools/snapshot.py              # 自动用 app/__init__.py 里的版本号
     python tools/snapshot.py 修完音频分页   # 带备注
     python tools/snapshot.py --no-dist     # 不包含 dist/ 里的 exe 产物
+    python tools/snapshot.py --raw         # 保留原始 config.json（默认脱敏）
 
 产出：archives/v<版本>_<时间>[_备注].zip
 包含：全部源码、assets、docs、HANDOFF.md、README.md、config.json、MANIFEST.txt，
@@ -13,6 +14,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 import os
 import subprocess
 import sys
@@ -45,7 +47,40 @@ def _run(cmd: list[str]) -> str:
         return "（未检测到）"
 
 
-def build_manifest(version: str, files: int, size: int, has_dist: bool, dist_size: int) -> str:
+def sanitize_config(raw: bytes) -> bytes:
+    """把 config.json 里的个人痕迹替换掉，防止外发快照泄漏路径与凭证。
+
+    - 家目录前缀 → %USERPROFILE%
+    - cookies 文件路径、手动代理地址 → 清空
+    - deps_cache 里存的是绝对路径，整块丢弃
+    """
+    try:
+        cfg = json.loads(raw.decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return raw
+    if not isinstance(cfg, dict):
+        return raw
+
+    home = os.path.expanduser("~")
+
+    def mask_path(value):
+        if not isinstance(value, str) or not value:
+            return value
+        return value.replace(home, "%USERPROFILE%").replace(home.replace("\\", "/"), "%USERPROFILE%")
+
+    for key in ("download_dir", "ytdlp_path", "ffmpeg_dir", "deno_path", "cookies_file"):
+        if key in cfg:
+            cfg[key] = mask_path(cfg[key])
+    cfg["cookies_file"] = ""
+    if cfg.get("proxy_mode") == "manual":
+        cfg["proxy_url"] = ""
+    cfg.pop("deps_cache", None)
+    cfg.pop("window_geometry", None)
+    return json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def build_manifest(version: str, files: int, size: int, has_dist: bool, dist_size: int,
+                   keep_raw: bool = False) -> str:
     ytdlp = os.path.join(ROOT, "yt-dlp.exe")
     lines = [
         "YT 下载器 — 项目快照",
@@ -66,7 +101,11 @@ def build_manifest(version: str, files: int, size: int, has_dist: bool, dist_siz
         "  - 源码：main.py / app/ / tools/",
         "  - 文档：HANDOFF.md（交接）/ README.md（使用）/ docs/yt-dlp-feature-map.md（功能地图）",
         "  - 资源：assets/（图标、下拉箭头）、docs/screenshot.png",
-        "  - 配置：config.json（当前偏好，可直接覆盖回去）",
+        (
+            "  - 配置：config.json（已脱敏：家目录→%USERPROFILE%，清空 cookies/代理，去掉 deps_cache）"
+            if not keep_raw
+            else "  - 配置：config.json（原样，含本地路径，勿外发）"
+        ),
         (
             f"  - EXE：已包含 dist/ 下的绿色版（{dist_size / 1024 / 1024:.1f} MB），解压即可运行"
             if has_dist
@@ -100,6 +139,7 @@ def _pyside_version() -> str:
 def main() -> int:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     include_dist = "--no-dist" not in sys.argv
+    keep_raw = "--raw" in sys.argv
     tag = "_".join(args).strip()
     version = read_version()
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
@@ -131,14 +171,18 @@ def main() -> int:
                     continue
                 full = os.path.join(dirpath, filename)
                 rel = os.path.relpath(full, ROOT)
-                zf.write(full, rel)
+                if rel == "config.json" and not keep_raw:
+                    with open(full, "rb") as fh:
+                        zf.writestr(rel, sanitize_config(fh.read()))
+                else:
+                    zf.write(full, rel)
                 count += 1
     # zip 关闭后才知道真实体积，所以 MANIFEST 最后追加
     size = os.path.getsize(target)
     with zipfile.ZipFile(target, "a", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(
             "MANIFEST.txt",
-            build_manifest(version, count + 1, size, has_dist, dist_size),
+            build_manifest(version, count + 1, size, has_dist, dist_size, keep_raw),
         )
 
     print(f"已生成：{target}")

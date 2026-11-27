@@ -46,6 +46,54 @@ def _install_excepthook() -> None:
     sys.excepthook = hook
 
 
+def _focus_existing_window() -> bool:
+    """把已经打开的窗口拉到前台。标题会变（解析后带视频名），所以用包含匹配。"""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        found: list[int] = []
+        callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def _enum(hwnd, _lparam):
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                if "YT 下载器" in buf.value:
+                    found.append(hwnd)
+                    return False
+            return True
+
+        user32.EnumWindows(callback_type(_enum), 0)
+        if not found:
+            return False
+        hwnd = found[0]
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        user32.SetForegroundWindow(hwnd)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _acquire_single_instance():
+    """拿不到锁说明已有实例在跑；尝试唤醒它并让新进程退出。
+
+    多开最直接的危害是两个进程同时写 config.json / history.json。
+    """
+    from PySide6.QtCore import QLockFile
+
+    lock = QLockFile(os.path.join(app_dir(), "app.lock"))
+    lock.setStaleLockTime(0)
+    if lock.tryLock(100):
+        return lock
+    _focus_existing_window()
+    return None
+
+
 def _make_splash():
     """启动图：Windows 字体库初始化要 1.4 秒，先用纯图形遮住这段空窗。
 
@@ -75,6 +123,10 @@ def _make_splash():
 
 def main() -> int:
     _install_excepthook()
+
+    lock = _acquire_single_instance()
+    if lock is None:
+        return 0
 
     if os.name == "nt":
         try:

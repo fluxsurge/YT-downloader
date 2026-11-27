@@ -34,7 +34,10 @@ class HistoryDialog(QDialog):
         root.setContentsMargins(16, 14, 16, 12)
         root.setSpacing(10)
 
-        hint = QLabel("同一个「视频 + 音频 + 容器」组合只会记录一条；双击可直接打开文件。")
+        hint = QLabel(
+            "同一个「视频 + 音频 + 容器」组合只会记录一条；双击可直接打开文件。\n"
+            "删除单条或清空只移除记录，不会删除本地已下载的视频文件。"
+        )
         hint.setObjectName("Hint")
         root.addWidget(hint)
 

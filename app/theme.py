@@ -207,6 +207,22 @@ QTableWidget::item {
     padding: 2px 6px;
     border: none;
 }
+QLabel#Phase {
+    color: #B0B0B0;
+    font-size: 12px;
+}
+QLabel#Phase[state="current"] {
+    color: $BRAND;
+    font-weight: 600;
+}
+QLabel#Phase[state="done"] {
+    color: #1E8E3E;
+}
+QLabel#PhaseArrow {
+    color: #DADADA;
+    font-size: 12px;
+}
+
 QTableWidget::item:selected {
     background: #FFD6D6;
     color: #8B0000;

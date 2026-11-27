@@ -8,7 +8,7 @@
   "cookies_file": "",
   "concurrent_fragments": 8,
   "infinite_retry": true,
-  "download_dir": "C:\\Users\\GUOCAN\\Downloads",
+  "download_dir": "%USERPROFILE%\\Downloads",
   "output_template": "%(title)s.%(ext)s",
   "audio_pref": "m4a",
   "audio_mode": "copy",
@@ -21,32 +21,5 @@
   "container": "auto",
   "extra_args": "",
   "last_quality": "best",
-  "check_update": true,
-  "window_geometry": "AdnQywADAAAAAAJmAAAASgAABdUAAAN0AAACZgAAAGkAAAXVAAADdAAAAAAAAAAAB4AAAAJmAAAAaQAABdUAAAN0",
-  "deps_cache": {
-    "ytdlp": {
-      "path": "C:\\Users\\GUOCAN\\WorkBuddy AI\\2026-11-24-16-49-13\\yt-dlp-gui\\yt-dlp.exe",
-      "stamp": [
-        23627865,
-        1795510709
-      ],
-      "version": "2026.11.23"
-    },
-    "ffmpeg": {
-      "path": "C:\\Users\\GUOCAN\\AppData\\Local\\ffmpeg\\ffmpeg-9.0.1-essentials_build\\bin\\ffmpeg.EXE",
-      "stamp": [
-        102856192,
-        1787741370
-      ],
-      "version": "9.0.1-essentials_build-www.gyan.dev"
-    },
-    "deno": {
-      "path": "C:\\Users\\GUOCAN\\.deno\\bin\\deno.EXE",
-      "stamp": [
-        97462048,
-        1789548464
-      ],
-      "version": "deno 2.9.7 (stable, release, x86_64-pc-windows-msvc)"
-    }
-  }
+  "check_update": true
 }

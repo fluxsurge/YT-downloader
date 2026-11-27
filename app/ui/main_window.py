@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import base64
 import os
+import subprocess
 from collections import deque
+from typing import Optional
 
 from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import (
@@ -74,6 +76,7 @@ CONTAINER_TIP = (
 
 MIN_VIDEO_HEIGHT = 1080
 MIN_AUDIO_ABR = 100  # kbps，低于此值默认隐藏
+PHASE_TEXTS = ["① 视频流", "② 音频流", "③ 封装"]
 
 
 # --------------------------------------------------------------------------- #
@@ -236,6 +239,8 @@ class MainWindow(QMainWindow):
         self.duration = 0.0
         self._force_download = False
         self._pending: dict = {}
+        self._phase = 0
+        self._last_ratio = 0.0
         self._cancel_requested = False
         saved_mode = cfg.get("last_quality") or "best"
         self.mode = saved_mode if saved_mode in ("best", "1080", "720") else "best"
@@ -621,6 +626,24 @@ class MainWindow(QMainWindow):
         box = QVBoxLayout(wrapper)
         box.setContentsMargins(0, 0, 0, 0)
         box.setSpacing(5)
+        steps = QHBoxLayout()
+        steps.setSpacing(6)
+        self.phase_labels: list[QLabel] = []
+        self.phase_arrows: list[QLabel] = []
+        for index, text in enumerate(PHASE_TEXTS):
+            label = QLabel(text)
+            label.setObjectName("Phase")
+            label.setProperty("state", "pending")
+            self.phase_labels.append(label)
+            steps.addWidget(label)
+            if index < len(PHASE_TEXTS) - 1:
+                arrow = QLabel("→")
+                arrow.setObjectName("PhaseArrow")
+                self.phase_arrows.append(arrow)
+                steps.addWidget(arrow)
+        steps.addStretch(1)
+        box.addLayout(steps)
+
         labels = QHBoxLayout()
         self.stage_label = QLabel("就绪")
         self.stage_label.setObjectName("Muted")
@@ -639,6 +662,45 @@ class MainWindow(QMainWindow):
         box.addWidget(self.progress)
         wrapper.setVisible(False)
         return wrapper
+
+    def _phase_for_format(self, format_id: str) -> Optional[int]:
+        """按 format_id 判断当前在下载哪一段；判断不出来返回 None。"""
+        if not format_id:
+            return None
+        if self.audio_only_check.isChecked():
+            return 0
+
+        def matches(target) -> bool:
+            if target is None:
+                return False
+            return format_id == target.format_id or format_id.startswith(target.format_id + "-")
+
+        if matches(self.audio_sel):
+            return 1
+        if matches(self.video_sel):
+            return 0
+        return None
+
+    def _setup_phases(self, audio_only: bool) -> None:
+        """纯音频时只有「音频流 → 封装」两步。"""
+        texts = ["① 音频流", "② 封装"] if audio_only else PHASE_TEXTS
+        for index, label in enumerate(self.phase_labels):
+            if index < len(texts):
+                label.setText(texts[index])
+                label.show()
+            else:
+                label.hide()
+        for index, arrow in enumerate(self.phase_arrows):
+            arrow.setVisible(index < len(texts) - 1)
+
+    def _set_phase(self, index: int) -> None:
+        self._phase = index
+        for i, label in enumerate(self.phase_labels):
+            state = "done" if i < index else "current" if i == index else "pending"
+            if label.property("state") != state:
+                label.setProperty("state", state)
+                label.style().unpolish(label)
+                label.style().polish(label)
 
     def _build_log(self) -> QPlainTextEdit:
         self.log_edit = QPlainTextEdit()
@@ -668,6 +730,20 @@ class MainWindow(QMainWindow):
         self.open_file_btn.setEnabled(False)
         self.open_file_btn.clicked.connect(self._on_open_file)
         bar.addPermanentWidget(self.open_file_btn)
+
+        self.reveal_btn = QPushButton("定位文件")
+        self.reveal_btn.setObjectName("Link")
+        self.reveal_btn.setToolTip("在资源管理器中选中这个文件")
+        self.reveal_btn.setVisible(False)
+        self.reveal_btn.clicked.connect(self._on_reveal_file)
+        bar.addPermanentWidget(self.reveal_btn)
+
+        self.copy_path_btn = QPushButton("复制路径")
+        self.copy_path_btn.setObjectName("Link")
+        self.copy_path_btn.setToolTip("把完整路径复制到剪贴板")
+        self.copy_path_btn.setVisible(False)
+        self.copy_path_btn.clicked.connect(self._on_copy_path)
+        bar.addPermanentWidget(self.copy_path_btn)
 
         self.open_btn = QPushButton("打开文件夹")
         self.open_btn.setObjectName("Link")
@@ -1224,6 +1300,19 @@ class MainWindow(QMainWindow):
             bits.append(f"合计 {approx}{engine.human_size(total)}")
         container = engine.container_hint(self.cfg, video, audio, False)
         bits.append(f"容器 {container}")
+
+        # 强制 mp4 且流里有 VP9/Opus → 播放器多半不认，给软提示（不拦截）
+        risky = ""
+        if container == "mp4" and (self.cfg.get("container") or "auto") == "mp4":
+            vcodec = (video.vcodec or "").lower()
+            acodec = (audio.acodec or "").lower() if audio else ""
+            if vcodec.startswith(("vp9", "vp09", "vp8")) or acodec.startswith("opus"):
+                risky = "⚠ 装的是 VP9/Opus，很多播放器会黑屏"
+        self.container_combo.setToolTip(
+            CONTAINER_TIP + (f"\n\n{risky}" if risky else "")
+        )
+        if risky:
+            bits.append(risky)
         extra = engine.enhance_text(self.cfg, container, False)
         if extra:
             bits.append(f"附加 {extra}")
@@ -1329,6 +1418,35 @@ class MainWindow(QMainWindow):
                 self.retry_btn.setVisible(False)
                 return
 
+        # 目录可写 + 磁盘空间预检（放在历史跳过判断之后，跳过时不打扰）
+        ok, reason = engine.probe_writable(out_dir)
+        if not ok:
+            QMessageBox.warning(self, "保存目录不可用", reason)
+            self._set_status("保存目录不可写")
+            return
+        need = 0
+        for item in (self.video_sel, self.audio_sel):
+            size, _ = engine.estimate_size(item, self.duration)
+            need += size or 0
+        enough, space_msg = engine.check_disk_space(out_dir, need)
+        if not enough:
+            answer = QMessageBox.question(
+                self, "空间可能不够",
+                f"{space_msg}\n\n仍要继续下载吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self._set_status("已取消（空间不足）")
+                return
+
+        self._setup_phases(audio_only)
+        self._set_phase(0)
+        self._last_ratio = 0.0
+        self.stage_label.setStyleSheet("")
+        self.reveal_btn.setVisible(False)
+        self.copy_path_btn.setVisible(False)
+
         self.log_edit.clear()
         suffix = "  [仅音频 → mp3]" if audio_only else f"  [容器 {shown_container}]"
         self._append_log(f'$ yt-dlp -f "{selector}"' + suffix)
@@ -1359,6 +1477,8 @@ class MainWindow(QMainWindow):
         self.retry_btn.setVisible(False)
         self.redownload_btn.setVisible(False)
         self._cancel_requested = False
+        self._phase = 0
+        self._last_ratio = 0.0
         self.progress.setRange(0, 0)
         self.stage_label.setText("正在启动下载…")
         self.metrics_label.setText("")
@@ -1367,20 +1487,39 @@ class MainWindow(QMainWindow):
     def _on_progress(self, p: engine.Progress) -> None:
         if p.postprocessor:
             if p.status == "started":
-                self.stage_label.setText("正在合并 / 转码…")
+                self._set_phase(2 if not self.audio_only_check.isChecked() else 1)
+                self.stage_label.setText("正在合并 / 封装…")
                 self.progress.setRange(0, 0)
             elif p.status == "finished":
                 self.stage_label.setText("后处理完成")
             return
 
         if p.status == "finished":
-            self.stage_label.setText("下载完成，正在后处理…")
+            self.stage_label.setText("这一段下完了，准备下一段…")
             self.progress.setRange(0, 0)
             return
 
         total = p.total
+        ratio = min(100.0, (p.downloaded or 0) / total * 100.0) if total else 0.0
+        # 优先用 format_id 精确判断（313 是视频流、140 是音频流）
+        phase = self._phase_for_format(p.format_id)
+        if phase is not None:
+            if phase != self._phase:
+                self._set_phase(phase)
+        elif (
+            p.status == "downloading"
+            and total
+            and self._last_ratio - ratio > 20
+            and self._phase == 0
+        ):
+            # 兜底：引擎没给 format_id 时，用百分比骤降猜换流。
+            # 必须限定 status == downloading——finished 那行没有 total，
+            # 算出来是 0%，会被误判成「换到音频流了」。
+            self._set_phase(1)
         if total:
-            ratio = min(100.0, (p.downloaded or 0) / total * 100.0)
+            self._last_ratio = ratio
+
+        if total:
             self.progress.setRange(0, 100)
             self.progress.setValue(int(ratio))
         else:
@@ -1399,7 +1538,9 @@ class MainWindow(QMainWindow):
         if p.frag_count:
             bits.append(f"分片 {p.frag_index or 0}/{p.frag_count}")
         self.metrics_label.setText(" · ".join(bits))
-        self.stage_label.setText("正在下载")
+        stream = "音频流" if self._phase >= 1 or self.audio_only_check.isChecked() else "视频流"
+        tag = f"（{p.format_id}）" if p.format_id else ""
+        self.stage_label.setText(f"正在下载{stream}{tag}")
 
     def _on_filepath(self, path: str) -> None:
         self.last_file = path
@@ -1415,6 +1556,9 @@ class MainWindow(QMainWindow):
             self.progress.setRange(0, 100)
             self.progress.setValue(100)
             self.open_btn.setEnabled(True)
+            self.stage_label.setStyleSheet("")
+            self.reveal_btn.setVisible(bool(self.last_file))
+            self.copy_path_btn.setVisible(bool(self.last_file))
             self._record_history()
 
             if "has already been downloaded" in tail:
@@ -1454,7 +1598,10 @@ class MainWindow(QMainWindow):
             self.retry_btn.setVisible(True)
             self._record_history()
             name = os.path.basename(self.last_file)
-            self.stage_label.setText(f"视频已完成（部分附加项失败）· {name}")
+            self.stage_label.setText(f"⚠ 视频已完成，字幕/封面等附加项缺失 · {name}")
+            self.stage_label.setStyleSheet("color:#E67E22;")
+            self.reveal_btn.setVisible(True)
+            self.copy_path_btn.setVisible(True)
             self.metrics_label.setText("")
             self._append_log("== 视频已产出，但字幕/封面等附加项有报错 ==")
             self._set_status("完成，但附加项有失败")
@@ -1487,19 +1634,22 @@ class MainWindow(QMainWindow):
         ):
             answer = QMessageBox.question(
                 self,
-                "遇到 403",
-                f"{err.message}\n\n{err.hint}\n\n是否改用 Chrome Cookie 重试？\n"
-                "（请先完全退出 Chrome，否则读取会失败）",
+                "遇到 403 / 需要验证身份",
+                f"{err.message}\n\n{err.hint}\n\n"
+                "推荐用 cookies.txt（不需要退出浏览器，也不会因 App-Bound 加密失败）。\n\n"
+                "点「是」去设置里配置；点「否」改成 Chrome Cookie 直接重试（需先完全退出 Chrome）。",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.Yes,
             )
             if answer == QMessageBox.StandardButton.Yes:
-                self.cfg["cookies_browser"] = "chrome"
-                save_config(self.cfg)
-                self._refresh_deps_ui()
-                self._append_log("# 已切换到 Chrome Cookie，准备重试")
-                QTimer.singleShot(200, self._start_download)
+                self._open_settings()
                 return
+            self.cfg["cookies_browser"] = "chrome"
+            save_config(self.cfg)
+            self._refresh_deps_ui()
+            self._append_log("# 已切换到 Chrome Cookie，准备重试")
+            QTimer.singleShot(200, self._start_download)
+            return
 
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
@@ -1547,6 +1697,20 @@ class MainWindow(QMainWindow):
         from .history_dialog import HistoryDialog
 
         HistoryDialog(self).exec()
+
+    def _on_reveal_file(self) -> None:
+        if not self.last_file or not os.path.isfile(self.last_file):
+            return
+        try:
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(self.last_file)])
+        except Exception:  # noqa: BLE001
+            self._on_open_folder()
+
+    def _on_copy_path(self) -> None:
+        if not self.last_file:
+            return
+        QApplication.clipboard().setText(self.last_file)
+        self._set_status("路径已复制到剪贴板")
 
     def _on_open_file(self) -> None:
         if self.last_file and os.path.isfile(self.last_file):

@@ -1,9 +1,10 @@
 """打包成 Windows 绿色版（onedir）。
 
 用法：
-    .venv\\Scripts\\python.exe tools\\build_exe.py            # 正式版（无控制台）
-    .venv\\Scripts\\python.exe tools\\build_exe.py --console  # 排错版（带控制台）
-    .venv\\Scripts\\python.exe tools\\build_exe.py --no-zip   # 只出目录，不压缩
+    .venv\\Scripts\\python.exe tools\\build_exe.py               # 正式版（无控制台）
+    .venv\\Scripts\\python.exe tools\\build_exe.py --console     # 排错版（带控制台）
+    .venv\\Scripts\\python.exe tools\\build_exe.py --no-zip      # 只出目录，不压缩
+    .venv\\Scripts\\python.exe tools\\build_exe.py --bundle-deps # 连 ffmpeg/deno 一起打包（真·离线）
 
 产物：
     dist/YT下载器/                 ← 解压即用，含 yt-dlp.exe / assets / config
@@ -29,8 +30,47 @@ APP_DIR = os.path.join(DIST_ROOT, NAME)
 ARCHIVES = os.path.join(ROOT, "archives")
 PYTHON = os.path.join(ROOT, ".venv", "Scripts", "python.exe")
 
-COPY_FILES = ["yt-dlp.exe", "README.md", "config.json"]
+COPY_FILES = ["yt-dlp.exe", "README.md", "CHANGELOG.md", "LICENSE", "config.json"]
 COPY_DIRS = ["assets"]
+
+
+def _version_tuple(version: str) -> tuple[int, int, int, int]:
+    parts = []
+    for chunk in version.split(".")[:4]:
+        digits = "".join(c for c in chunk if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 4:
+        parts.append(0)
+    return tuple(parts)
+
+
+def write_version_file(version: str) -> str:
+    """生成 PE 版本资源，填上版本号/产品名，降低杀软误报与「未知发布者」观感。"""
+    quad = _version_tuple(version)
+    content = f"""VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers={quad}, prodvers={quad},
+    mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([StringTable('080404b0', [
+      StringStruct('CompanyName', 'YT Downloader'),
+      StringStruct('FileDescription', 'YouTube 下载器（yt-dlp GUI）'),
+      StringStruct('FileVersion', '{version}'),
+      StringStruct('InternalName', 'YTDownloader'),
+      StringStruct('OriginalFilename', 'YT下载器.exe'),
+      StringStruct('ProductName', 'YT 下载器'),
+      StringStruct('ProductVersion', '{version}')
+    ])]),
+    VarFileInfo([VarStruct('Translation', [2052, 1200])])
+  ]
+)
+"""
+    path = os.path.join(BUILD_ROOT, "version_info.txt")
+    os.makedirs(BUILD_ROOT, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(content)
+    return path
 
 
 def read_version() -> str:
@@ -75,6 +115,8 @@ def run_pyinstaller(console: bool) -> None:
         BUILD_ROOT,
         "--specpath",
         BUILD_ROOT,
+        "--version-file",
+        write_version_file(read_version()),
         os.path.join(ROOT, "main.py"),
     ]
     print("$ " + " ".join(cmd))
@@ -99,6 +141,24 @@ def copy_extras() -> None:
             shutil.rmtree(dst)
         shutil.copytree(src, dst)
         print(f"  + {name}/")
+
+
+def bundle_deps() -> None:
+    """把 ffmpeg / deno 一起拷进 dist，做出真正零依赖的离线包。"""
+    sys.path.insert(0, ROOT)
+    from app import engine  # noqa: E402
+
+    cfg = {"ffmpeg_dir": "", "deno_path": ""}
+    for label, path in (
+        ("ffmpeg", engine.find_ffmpeg(cfg)),
+        ("deno", engine.find_deno(cfg)),
+    ):
+        if not path or not os.path.isfile(path):
+            print(f"  ! 找不到 {label}，跳过")
+            continue
+        target = os.path.join(APP_DIR, os.path.basename(path))
+        shutil.copy2(path, target)
+        print(f"  + {os.path.basename(path)}（{os.path.getsize(target) / 1024 / 1024:.0f} MB）")
 
 
 def dir_size(path: str) -> int:
@@ -142,6 +202,8 @@ def main() -> int:
 
     print("== 拷贝引擎与资源 ==")
     copy_extras()
+    if "--bundle-deps" in sys.argv:
+        bundle_deps()
 
     exe = os.path.join(APP_DIR, f"{NAME}.exe")
     if not os.path.isfile(exe):

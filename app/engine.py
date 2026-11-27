@@ -26,7 +26,7 @@ PROGRESS_TEMPLATE = (
     "download:PROG|%(progress.status)s|%(progress.downloaded_bytes)s|"
     "%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|"
     "%(progress.speed)s|%(progress.eta)s|%(progress.fragment_index)s|"
-    "%(progress.fragment_count)s"
+    "%(progress.fragment_count)s|%(info.format_id)s"
 )
 POSTPROCESS_TEMPLATE = "postprocess:PP|%(progress.status)s|%(progress.postprocessor)s"
 
@@ -682,6 +682,8 @@ def enhance_args(cfg: dict, container: str, audio_only: bool) -> list[str]:
         # 字幕接口经常 429，不加这个会让整条下载直接失败（视频一个字节都下不来）
         args += [
             "--ignore-errors",
+            "--sleep-subtitles",
+            "1",
             "--write-auto-subs",
             "--sub-langs",
             (cfg.get("sub_langs") or "zh-Hans,zh-Hant,en").strip(),
@@ -706,6 +708,45 @@ def enhance_text(cfg: dict, container: str, audio_only: bool) -> str:
     if plan["subs"]:
         bits.append("字幕内嵌" if plan["embed_subs"] else "字幕外挂")
     return "+".join(bits)
+
+
+def probe_writable(out_dir: str) -> tuple[bool, str]:
+    """用 0 字节探测文件确认目录真的可写（比 os.access 可靠，能发现只读共享盘）。"""
+    if not out_dir:
+        return False, "还没有选择保存目录"
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"目录不存在且无法创建：{exc}"
+    probe = os.path.join(out_dir, ".write_probe")
+    try:
+        with open(probe, "w", encoding="utf-8") as fh:
+            fh.write("ok")
+        os.remove(probe)
+        return True, ""
+    except Exception as exc:  # noqa: BLE001
+        return False, f"目录不可写：{exc}"
+
+
+def check_disk_space(out_dir: str, need_bytes: int, factor: float = 2.0) -> tuple[bool, str]:
+    """剩余空间不足时返回 (False, 提示)。
+
+    合并阶段要同时存在视频流 + 音频流 + 成品，所以按 need × factor 预留。
+    估算值本身是近似值，factor 取 2.0 而不是 2.5，避免误报太频繁。
+    """
+    if not out_dir or not need_bytes:
+        return True, ""
+    try:
+        usage = shutil.disk_usage(out_dir)
+    except Exception:  # noqa: BLE001
+        return True, ""
+    required = int(need_bytes * factor)
+    if usage.free >= required:
+        return True, ""
+    return False, (
+        f"磁盘剩余 {human_size(usage.free)}，本次预计需要约 {human_size(required)}"
+        f"（按下载大小的 {factor:.0f} 倍预留合并空间）"
+    )
 
 
 def filename_budget(out_dir: str) -> int:
@@ -870,6 +911,7 @@ class Progress:
     frag_index: Optional[int] = None
     frag_count: Optional[int] = None
     postprocessor: str = ""
+    format_id: str = ""
 
 
 def parse_progress_line(line: str) -> Optional[Progress]:
@@ -885,6 +927,10 @@ def parse_progress_line(line: str) -> Optional[Progress]:
                 return None
 
         total = num(3) or num(4)
+        fmt_id = ""
+        if len(parts) > 9:
+            raw_id = parts[9].strip()
+            fmt_id = "" if raw_id in ("", "NA", "None") else raw_id
         return Progress(
             status=parts[1],
             downloaded=num(2),
@@ -893,6 +939,7 @@ def parse_progress_line(line: str) -> Optional[Progress]:
             eta=num(6),
             frag_index=num(7, int),
             frag_count=num(8, int),
+            format_id=fmt_id,
         )
     if line.startswith("PP|"):
         parts = line.split("|")
@@ -1082,12 +1129,32 @@ def test_connectivity(cfg: dict, timeout: int = 8) -> tuple[bool, str]:
 
 
 def update_engine(cfg: dict, deps: Deps, timeout: int = 300) -> tuple[int, str]:
+    """更新引擎；失败自动回滚，避免把 yt-dlp.exe 更新成砖。
+
+    yt-dlp -U 是就地替换自身，中途断网/被杀软拦截会留下半个文件。
+    """
     if not deps.ytdlp:
         return -1, "找不到 yt-dlp.exe"
-    cmd = [deps.ytdlp, "-U", "--no-colors", "--encoding", "utf-8", "--ignore-config"]
+
+    exe = deps.ytdlp
+    backup = exe + ".bak"
+    try:
+        shutil.copy2(exe, backup)
+    except Exception as exc:  # noqa: BLE001
+        return -1, f"无法备份现有引擎（可能被占用）：{exc}"
+
+    cmd = [exe, "-U", "--no-colors", "--encoding", "utf-8", "--ignore-config"]
     proxy = resolve_proxy(cfg)
     if proxy:
         cmd += ["--proxy", proxy]
+
+    def rollback(reason: str) -> tuple[int, str]:
+        try:
+            shutil.copy2(backup, exe)
+            return -1, f"{reason}\n\n已自动回滚到更新前的版本。"
+        except Exception as exc:  # noqa: BLE001
+            return -1, f"{reason}\n\n回滚也失败了：{exc}\n备份在 {backup}"
+
     try:
         cp = subprocess.run(
             cmd,
@@ -1099,8 +1166,18 @@ def update_engine(cfg: dict, deps: Deps, timeout: int = 300) -> tuple[int, str]:
             **_popen_kwargs(),
         )
         output = ((cp.stdout or "") + (cp.stderr or "")).strip()
-        return cp.returncode, output or "（引擎没有输出）"
     except subprocess.TimeoutExpired:
-        return -1, "更新超时（网络太慢或代理不通）"
-    except Exception as exc:
-        return -1, f"更新失败：{exc}"
+        return rollback("更新超时（网络太慢或代理不通）")
+    except Exception as exc:  # noqa: BLE001
+        return rollback(f"更新失败：{exc}")
+
+    # 探活：能正常输出 --version 才算更新成功
+    version = _read_version(exe)
+    if not version:
+        return rollback("更新后引擎无法运行（可能被杀软拦截或文件损坏）")
+
+    try:
+        os.remove(backup)
+    except OSError:
+        pass
+    return cp.returncode, f"{output or '（引擎没有输出）'}\n\n当前版本：{version}"

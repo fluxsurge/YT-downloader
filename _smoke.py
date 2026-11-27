@@ -5,6 +5,10 @@ import traceback
 
 os.environ["YTDLP_GUI_CONFIG"] = os.path.join(tempfile.gettempdir(), "cfg_smoke.json")
 os.environ["YTDLP_GUI_HISTORY"] = os.path.join(tempfile.gettempdir(), "hist_smoke.json")
+# 每次从干净配置开始，否则上一轮写进去的 cookies_browser 会污染后续解析
+for _path in (os.environ["YTDLP_GUI_CONFIG"], os.environ["YTDLP_GUI_HISTORY"]):
+    if os.path.exists(_path):
+        os.remove(_path)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -51,10 +55,14 @@ class FakeBox:
         return 3
 
     information = warning = critical = staticmethod(lambda *a, **k: 3)
-    question = staticmethod(lambda *a, **k: 2)
+    # 一律回答「是」：403 引导会走「去设置」而不是真的重试下载
+    question = staticmethod(lambda *a, **k: 1)
 
 
 mw.QMessageBox = FakeBox
+# 403 引导会打开模态设置窗口，headless 下会阻塞；测试里只记录调用
+_opened_settings = []
+mw.MainWindow._open_settings = lambda self: _opened_settings.append(True)
 
 app = QApplication([])
 app.setStyle("Fusion")
